@@ -1,9 +1,5 @@
 # Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s (27B) / 200 t/s (35B MoE), step by step
 
-**TL;DR:** Qwen3.6-27B-FP8 + MTP n=3 on an RTX PRO 6000 Blackwell (96GB). ~115–120 tok/s sustained at 128K context (256K at 0.97 mem util). Same recipe with the 35B-A3B MoE variant hits ~200 tok/s at 256K. Tested on WSL2, should work identically on bare-metal Linux.
-
----
-
 ## The Numbers
 
 | Setup | Hardware | Context | t/s |
@@ -351,4 +347,4 @@ What I added: adapted the 24GB/3090 recipes to the 96GB RTX PRO 6000 where FP8 +
 
 ---
 
-*Questions or issues, drop them below. I've been running this 24/7 for a few weeks now and the recipe is solid.*
+*Questions or issues, drop them below.*
