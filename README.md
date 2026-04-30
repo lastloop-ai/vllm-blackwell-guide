@@ -2,6 +2,8 @@
 
 Qwen3.6 27B and 35B-A3B MoE both run well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + MTP speculative decoding to actually work on sm_120 requires a few patches that aren't documented anywhere in one place. This is that guide — 10 steps from a fresh WSL2 install to a working OpenAI-compatible API server. Tested on WSL2, should work identically on bare-metal Linux.
 
+*Last tested: April 2026 — vLLM v0.19.1, CUDA 12.8, NVIDIA driver 570.xx, Ubuntu 24.04 on WSL2.*
+
 ## The Numbers
 
 | Setup | Hardware | Context | t/s |
