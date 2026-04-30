@@ -1,5 +1,7 @@
 # Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s (27B) / 200 t/s (35B MoE), step by step
 
+Qwen3.6 27B and 35B-A3B MoE both run well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + MTP speculative decoding to actually work on sm_120 requires a few patches that aren't documented anywhere in one place. This is that guide — 10 steps from a fresh WSL2 install to a working OpenAI-compatible API server. Tested on WSL2, should work identically on bare-metal Linux.
+
 ## The Numbers
 
 | Setup | Hardware | Context | t/s |
