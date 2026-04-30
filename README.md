@@ -338,6 +338,42 @@ No cloud dependency, no API keys, no rate limits. Just a workstation with a very
 
 ---
 
+## Docker (Alternative to Manual Setup)
+
+If you'd rather skip steps 1–8 and get a pre-patched image, the repo includes a Dockerfile and docker-compose that bake in both patches:
+
+```bash
+# Clone the repo
+git clone https://github.com/lastloop-ai/vllm-blackwell-guide.git
+cd vllm-blackwell-guide
+
+# Download the model to a local directory
+pip install huggingface-hub
+huggingface-cli download Qwen/Qwen3.6-27B-FP8 \
+  --local-dir ./models/Qwen3.6-27B-FP8 \
+  --local-dir-use-symlinks False
+
+# Run the 27B variant
+docker compose --profile 27b up -d
+
+# Or the 35B MoE variant (~200 tok/s)
+# huggingface-cli download Qwen/Qwen3.6-35B-A3B-FP8 --local-dir ./models/Qwen3.6-35B-A3B-FP8 --local-dir-use-symlinks False
+# docker compose --profile 35b-moe up -d
+```
+
+The server is available at `http://localhost:8000/v1`. All flags are configurable via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL` | `/models/Qwen3.6-27B-FP8` | Model path inside the container |
+| `MODEL_NAME` | `qwen3.6-27b` | Name exposed via the API |
+| `MAX_MODEL_LEN` | `131072` | Context length (set to `256000` for 256K) |
+| `GPU_MEM_UTIL` | `0.92` | VRAM fraction (push to `0.97` for 256K) |
+| `NUM_SPEC_TOKENS` | `3` | MTP draft tokens per step |
+| `CUDA_VISIBLE_DEVICES` | `0` | Which GPU to use |
+
+---
+
 ## Credits
 
 This recipe builds on work from several people:

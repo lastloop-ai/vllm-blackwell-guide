@@ -1,0 +1,48 @@
+services:
+  # ── Qwen3.6-27B-FP8 — ~120 tok/s, up to 256K context ────────────────────
+  vllm-27b:
+    build: .
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - MODEL=/models/Qwen3.6-27B-FP8
+      - MODEL_NAME=qwen3.6-27b
+      - MAX_MODEL_LEN=131072
+      - GPU_MEM_UTIL=0.92
+      - NUM_SPEC_TOKENS=3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: [27b]
+
+  # ── Qwen3.6-35B-A3B-FP8 MoE — ~200 tok/s, up to 256K context ───────────
+  vllm-35b-moe:
+    build: .
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - MODEL=/models/Qwen3.6-35B-A3B-FP8
+      - MODEL_NAME=qwen3.6-35b-a3b
+      - MAX_MODEL_LEN=131072
+      - GPU_MEM_UTIL=0.92
+      - NUM_SPEC_TOKENS=3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles: [35b-moe]
