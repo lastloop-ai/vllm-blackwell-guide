@@ -1,34 +1,56 @@
-# Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s (27B) / 200 t/s (35B MoE), step by step
+# Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s (27B) / 234 t/s (dual-GPU LB), step by step
 
-Qwen3.6 27B and 35B-A3B MoE both run well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + MTP speculative decoding to actually work on sm_120 requires a few patches that aren't documented anywhere in one place. This is that guide — 10 steps from a fresh WSL2 install to a working OpenAI-compatible API server. Tested on WSL2, should work identically on bare-metal Linux.
+Qwen3.6 27B runs well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + MTP speculative decoding to actually work on sm_120 in WSL2 requires workarounds that aren't documented anywhere in one place. This is that guide — from a fresh WSL2 install to a working OpenAI-compatible API server. Tested on WSL2; bare-metal Linux should be identical or faster.
 
-*Last tested: April 2026 — vLLM v0.19.1, CUDA 12.8, NVIDIA driver 570.xx, Ubuntu 24.04 on WSL2.*
+*Last tested: May 2026 — vLLM v0.19.2rc1.dev214, CUDA 13.0 (PyPI), NVIDIA driver 581.42, Ubuntu 24.04 on WSL2.*
 
-## The Numbers
+## The Numbers (empirically verified, May 2026)
 
-| Setup | Hardware | Context | t/s |
+All numbers measured on RTX PRO 6000 Blackwell (96GB, 1792 GB/s), 3 runs of 1024 output tokens each:
+
+| Config | Hardware | t/s | Notes |
 |---|---|---|---|
-| llama.cpp (best GGUF) | RTX PRO 6000 96GB | 128K | ~35 |
-| vLLM FP8 (no MTP) | RTX PRO 6000 96GB | 128K | ~39 |
-| **vLLM FP8 + MTP n=3** | **RTX PRO 6000 96GB** | **256K** | **~115–120** |
-| **vLLM FP8 + MTP n=3 (35B-A3B MoE)** | **RTX PRO 6000 96GB** | **256K** | **~200** |
+| Eager mode, no MTP, no CUDA graphs | 1x RTX PRO 6000 | **24** | Bandwidth floor (dispatch overhead dominates) |
+| CUDA graphs + flash_attn, no MTP | 1x RTX PRO 6000 | **75** | 3.1x over eager — matches 1792 GB/s theory |
+| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **This guide's target config** |
+| CUDA graphs + flash_attn + MTP n=5 | 1x RTX PRO 6000 | **125** | +4% over n=3, marginal gain |
+| **Dual-replica nginx LB, C=4** | **2x RTX PRO 6000** | **234 aggregate** | **Two independent servers, no NCCL** |
 
-MTP = Multi-Token Prediction speculative decoding. It generates 3 draft tokens per forward pass, so you get roughly 3× the throughput for "free" once the draft model warms up.
+MTP speculative decoding metrics: mean acceptance length 3.19, per-position acceptance 0.87/0.72/0.60, avg draft acceptance 73%.
+
+### Bandwidth parity note
+
+The RTX PRO 6000 and RTX 5090 share **identical memory bandwidth** (1792 GB/s, 512-bit GDDR7 @ 28 Gbps). The PRO 6000's advantage is purely capacity (96 vs 32 GB), not speed per token. If you have a 5090, expect the same tok/s at equivalent configs.
 
 ---
 
 ## Prerequisites
 
-- RTX PRO 6000 Blackwell (96GB) — the recipe is specifically for this card
+- RTX PRO 6000 Blackwell (96GB) or RTX 5090 (32GB — use INT4 quant instead of FP8)
 - Windows 11 + WSL2 with Ubuntu 24.04 (tested; bare-metal Linux should be identical)
-- ~40GB free disk space for the 27B model, ~55GB for the 35B MoE
+- ~25GB free disk space for the INT4 model, ~40GB for FP8
 - Basic comfort with the terminal
+
+### CRITICAL: Prevent WSL2 auto-shutdown
+
+By default, WSL2 shuts down after ~15 seconds of idle (no active terminal sessions). This kills long-running vLLM services when you disconnect SSH. Add `vmIdleTimeout=-1` to your `.wslconfig` **before** setting up vLLM:
+
+```ini
+# C:\Users\<you>\.wslconfig  (on Windows, NOT inside WSL)
+[wsl2]
+memory=200GB
+swap=32GB
+processors=24
+vmIdleTimeout=-1
+```
+
+Then `wsl --shutdown` from PowerShell and reconnect.
 
 ---
 
 ## Step 1 — WSL2 + Ubuntu 24.04
 
-**Why:** vLLM is Linux-native. WSL2 provides a full Linux kernel and near-zero-overhead CUDA pass-through. The setup is identical to bare-metal Linux once you're inside the distro.
+**Why:** vLLM is Linux-native. WSL2 provides a full Linux kernel and near-zero-overhead CUDA pass-through.
 
 ```bash
 # In PowerShell (as Admin)
@@ -40,258 +62,189 @@ wsl -d Ubuntu-24.04
 
 ---
 
-## Step 2 — NVIDIA Drivers + CUDA 12.8
-
-**Why:** Blackwell (sm_120) is only fully supported from CUDA 12.8 onwards. The Windows host driver must be 570.xx or newer. Inside WSL2, the CUDA toolkit is installed separately from the host driver.
+## Step 2 — System packages
 
 ```bash
-# Verify host driver passes through
-nvidia-smi
-# Should show your RTX PRO 6000 and CUDA 12.8
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv ninja-build curl
+```
 
-# Install CUDA 12.8 toolkit inside WSL2
-wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-sudo apt-get -y install cuda-toolkit-12-8
+`ninja-build` is **mandatory** — flashinfer's JIT compiler invokes it directly.
 
-# Add to PATH
-echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
+You do **not** need a system-wide CUDA toolkit (`apt install cuda-toolkit-12-8`). We use the PyPI-shipped CUDA 13 components instead. If you have `/usr/local/cuda` pointing at CUDA 12.8 from an earlier install, that's fine — the setup explicitly works around it.
+
+---
+
+## Step 3 — Create the vLLM virtualenv
+
+```bash
+sudo mkdir -p /opt
+sudo python3.12 -m venv /opt/vllm-env
+sudo /opt/vllm-env/bin/pip install --upgrade pip wheel
 ```
 
 ---
 
-## Step 3 — Python 3.12 + Virtual Environment
+## Step 4 — Install vLLM nightly + CUDA 13
 
-**Why:** vLLM v0.19.1 is built against Python 3.12. Using a venv prevents system package conflicts and makes the entire setup trivial to nuke and rebuild.
+The stable vLLM 0.19.1 has a WSL2 MTP bug (CUDA driver error during subprocess fork). Use the nightly:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv python3-pip git
+WHEEL=$(curl -s "https://wheels.vllm.ai/nightly/cu130/vllm/" \
+  | grep -oE 'href="[^"]+x86_64\.whl"' | head -1 \
+  | sed 's/href="//;s/"$//')
+URL="https://wheels.vllm.ai/nightly/cu130/vllm/${WHEEL}"
+echo "Installing $URL"
+sudo /opt/vllm-env/bin/pip install --upgrade "$URL"
 
-mkdir -p ~/vllm-setup && cd ~/vllm-setup
-python3.12 -m venv venv
-source venv/bin/activate
-
-# Verify
-python --version  # 3.12.x
+# Add CUDA 13 dev pieces for flashinfer
+sudo /opt/vllm-env/bin/pip install nvidia-cuda-nvcc nvidia-cuda-cccl
 ```
 
----
-
-## Step 4 — Install vLLM v0.19.1 (`cu130` wheel)
-
-**Why:** v0.19.1 is the first release that contains the Blackwell TMA fix and the MTP loader. The `cu130` wheel bundles the PyPI CUDA 13 toolchain, so you don't need a full system CUDA development install.
+### Sanity check
 
 ```bash
-# Inside the venv
-pip install --upgrade pip
-
-# Install vLLM with CUDA 13 support
-pip install vllm==0.19.1 --extra-index-url https://download.pytorch.org/whl/cu130
-
-# Verify
-vllm --version  # Should show 0.19.1
-```
-
----
-
-## Step 5 — Apply the Blackwell TMA Patch
-
-**Why:** vLLM's Triton autotuner checks `is_tma_supported` and returns `True` for any compute capability >= 9. Blackwell consumer (sm_120) doesn't actually implement TMA — the descriptor buffer allocations blow up VRAM during kernel warmup and you get a silent OOM.
-
-```bash
-# Locate the file inside your venv
-VENV_PATH=$(python -c "import vllm; print(vllm.__path__[0])")
-FILE="$VENV_PATH/model_executor/layers/fla/ops/utils.py"
-
-# Backup
-cp "$FILE" "$FILE.bak"
-
-# Patch: cap TMA support at < sm_120 (sed is fragile here, use Python)
-python -c "
-import pathlib
-p = pathlib.Path('$FILE')
-src = p.read_text()
-patched = src.replace(
-    'torch.cuda.get_device_capability(0)[0] >= 9) and (',
-    'torch.cuda.get_device_capability(0)[0] >= 9 and torch.cuda.get_device_capability(0)[0] < 12) and ('
-)
-assert patched != src, 'Pattern not found — check vLLM version'
-p.write_text(patched)
-print('Patched. TMA now disabled for Blackwell (sm_120).')
+/opt/vllm-env/bin/python -c "
+import torch, vllm
+print(f'vLLM    {vllm.__version__}')
+print(f'torch   {torch.__version__}')
+print(f'CUDA    {torch.version.cuda}')
+print(f'GPU     {torch.cuda.get_device_name(0)}')
+print(f'sm      {torch.cuda.get_device_capability(0)}')
 "
 ```
 
 ---
 
-## Step 6 — Install `flashinfer` Attention Backend
-
-**Why:** FlashInfer ships with precompiled Blackwell kernels. If you use `flash_attn`, it tries to JIT-compile custom kernels at runtime, which requires a full CUDA toolkit that WSL2 doesn't cleanly provide. FlashInfer avoids this entirely.
+## Step 5 — Download the model
 
 ```bash
-pip install flashinfer-python
-
-# Verify it can see your GPU
-python -c "import flashinfer; print('FlashInfer OK')"
+sudo mkdir -p /opt/models
+export HF_TOKEN=hf_xxxxxxxxxx
+sudo HF_TOKEN=$HF_TOKEN /opt/vllm-env/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='Lorbus/Qwen3.6-27B-int4-AutoRound',
+    local_dir='/opt/models/Qwen3.6-27B-int4-AutoRound',
+    max_workers=4,
+)
+"
 ```
+
+### Model choice guide
+
+| Variant | Size | Speed (with MTP) | When to use |
+|---|---|---|---|
+| `Lorbus/Qwen3.6-27B-int4-AutoRound` | 19 GB | **120 t/s** | **Default — best speed/quality on 96GB** |
+| `Qwen/Qwen3.6-27B-FP8` | 31 GB | ~80 t/s (no MTP)* | Near-lossless quality, lower speed |
+| `Qwen/Qwen3.6-35B-A3B-FP8` | 35 GB | ~200 t/s | MoE — highest throughput |
+
+*FP8 with MTP on WSL2 is blocked by the flashinfer JIT bug (see below).
 
 ---
 
-## Step 7 — Download Qwen3.6-27B-FP8
-
-**Why:** FP8 is the sweet spot for Blackwell — it runs on the native tensor cores without the quality loss of heavier quantization, and at 96GB you have room for the full model (~38GB on disk) plus a massive KV cache. No GGUF, no AutoRound, no compromises needed at this VRAM tier.
+## Step 6 — Create the startup script
 
 ```bash
-# Create model directory
-mkdir -p ~/models
-cd ~/models
-
-# Download with huggingface-cli
-pip install huggingface-hub
-
-huggingface-cli download Qwen/Qwen3.6-27B-FP8 \
-  --local-dir ./Qwen3.6-27B-FP8 \
-  --local-dir-use-symlinks False
-
-# Verify size (~38GB)
-du -sh ./Qwen3.6-27B-FP8
-```
-
----
-
-## Step 8 — Apply `patch_tolist_cudagraph.py`
-
-**Why:** Qwen's MTP loader calls `.tolist()` during CUDA graph capture warmup. That `.tolist()` forces a CPU/GPU synchronization that silently breaks graph compilation. Without this patch, CUDA graphs never get captured and you lose 40–77% of your performance.
-
-```bash
-# Download the patch
-cd ~/vllm-setup
-wget https://raw.githubusercontent.com/noonghunna/qwen36-27b-single-3090/main/patches/patch_tolist_cudagraph.py
-
-# Run it against your vLLM install
-python patch_tolist_cudagraph.py --vllm-path $(python -c "import vllm; print(vllm.__path__[0])")
-
-echo "CUDA graph patch applied."
-```
-
----
-
-## Step 9 — Build the `vllm serve` Command with MTP n=3
-
-**Why:** Multi-Token Prediction speculative decoding runs a small draft head alongside the main model. It predicts 3 tokens ahead per forward pass, and the main model verifies them in parallel. Acceptance rate peaks at ~95% once warm, giving you effectively 3× the tokens per unit time.
-
-```bash
-# Create a startup script (note: uses $HOME, not ~, so paths resolve correctly)
-cat > ~/vllm-setup/start-vllm.sh << EOF
+sudo tee /usr/local/bin/start-vllm.sh > /dev/null <<'EOF'
 #!/bin/bash
-set -e
+set -euo pipefail
 
-source $HOME/vllm-setup/venv/bin/activate
+# CRITICAL: Don't put /usr/local/cuda/bin in PATH if it's CUDA 12.8.
+export PATH=/usr/bin:/usr/sbin
+export CUDA_HOME=/opt/vllm-env/lib/python3.12/site-packages/nvidia/cu13
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64
 
-python -m vllm.entrypoints.openai.api_server \\
-  --model $HOME/models/Qwen3.6-27B-FP8 \\
-  --served-model-name qwen3.6-27b \\
-  --host 0.0.0.0 \\
-  --port 8000 \\
-  --trust-remote-code \\
-  --dtype auto \\
-  --attention-backend flashinfer \\
-  --kv-cache-dtype fp8_e5m2 \\
-  --max-model-len 131072 \\
-  --gpu-memory-utilization 0.92 \\
-  --max-num-seqs 4 \\
-  --max-num-batched-tokens 2048 \\
-  --enable-prefix-caching \\
-  --enable-chunked-prefill \\
-  --enable-auto-tool-choice \\
-  --tool-call-parser qwen3_coder \\
-  --reasoning-parser qwen3 \\
-  --language-model-only \\
-  --speculative-config '{"model": "$HOME/models/Qwen3.6-27B-FP8", "num_speculative_tokens": 3, "draft_model_uses_mrope": true, "draft_model_uses_xdrope_dim": 0}'
+export CUDA_VISIBLE_DEVICES=0
+export FLASHINFER_CUDA_ARCH_LIST="12.0"
+export TORCH_CUDA_ARCH_LIST="12.0"
+
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_FLOAT32_MATMUL_PRECISION=high
+export VLLM_MARLIN_USE_ATOMIC_ADD=1
+export NCCL_CUMEM_ENABLE=0
+export NCCL_P2P_DISABLE=1
+export OMP_NUM_THREADS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=8
+
+# CRITICAL: Do NOT set these on WSL2:
+# - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (breaks MTP subprocess)
+# - VLLM_USE_FLASHINFER_SAMPLER=1 (JIT fails on sm_120)
+# - --kv-cache-dtype fp8_e5m2 (triggers broken flashinfer JIT during CUDA graph capture)
+# - --attention-backend flashinfer (CCCL header incompatibility on PyPI CUDA 13)
+
+exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
+  --model /opt/models/Qwen3.6-27B-int4-AutoRound \
+  --served-model-name qwen3.6-27b \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --trust-remote-code \
+  --quantization auto_round \
+  --attention-backend flash_attn \
+  --performance-mode interactivity \
+  --max-model-len 131072 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 2 \
+  --skip-mm-profiling \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --language-model-only \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 EOF
 
-chmod +x ~/vllm-setup/start-vllm.sh
+sudo chmod +x /usr/local/bin/start-vllm.sh
 ```
 
-**Flag reference:**
+### Why `flash_attn` not `flashinfer`
+
+The v1 README recommended `flashinfer`. On WSL2 with PyPI-only CUDA 13 (no system toolkit), this **crashes** during CUDA graph capture:
+
+```
+RuntimeError: Ninja build failed...
+error: "CUDA compiler and CUDA toolkit headers are incompatible"
+```
+
+The CCCL headers in the PyPI `nvidia-cuda-nvcc` package conflict with flashinfer's JIT compilation for the `batch_prefill_with_kv_cache` kernel on sm_120f. This is also why `--kv-cache-dtype fp8_e5m2` crashes — it triggers the same flashinfer JIT path.
+
+`flash_attn` ships precompiled wheels that work on Blackwell out of the box. The tradeoff: no FP8 KV cache. At 96GB with INT4 weights (17GB), you still get ~228K tokens of BF16 KV cache — plenty for 128K context.
+
+If you have the **full system CUDA 13 toolkit** (`apt install cuda-toolkit-13-0`), you can switch to `flashinfer` + `--kv-cache-dtype fp8_e4m3` for ~10-15% more speed on long contexts.
+
+### Flag reference
 
 | Flag | What it does |
 |------|--------------|
-| `--kv-cache-dtype fp8_e5m2` | Stores KV cache in FP8 instead of FP16 — doubles the number of tokens that fit in cache for the same VRAM |
-| `--gpu-memory-utilization 0.92` | Reserves 92% of 96GB (~88GB) for model + cache. Push to `0.97` for 256K context |
-| `--max-num-seqs 4` | Continuous batching — 4 concurrent requests share the GPU instead of queueing serially |
-| `--max-num-batched-tokens 2048` | Chunk size for batched prefill |
-| `--enable-chunked-prefill` | Splits long prefills into chunks, interleaved with generation — prevents one long prompt from blocking short ones |
-| `--enable-prefix-caching` | Caches KV for identical prompt prefixes — your system prompt is computed once and reused across requests |
-| `--language-model-only` | Skips loading the vision encoder (Qwen3.6 is multimodal). Saves ~2GB VRAM |
-
-**Note:** `--max-model-len 131072` gives 128K context. If you want the full 256K, change it to `256000` and bump `--gpu-memory-utilization` to `0.97`.
-
----
-
-## Step 10 — Verify with a Warmup Request
-
-**Why:** Blackwell CUDA graph compilation failures are completely silent until the first real inference call. The server starts fine, then dies on the first token. A warmup request forces graph capture and exposes any remaining issues immediately.
-
-```bash
-# Start the server in one terminal
-~/vllm-setup/start-vllm.sh
-
-# Wait for "Application startup complete." (~2–3 minutes on first boot)
-
-# In another terminal, run a warmup:
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.6-27b",
-    "messages": [{"role": "user", "content": "Say hello and nothing else."}],
-    "max_tokens": 50
-  }'
-
-# You should get a JSON response with generated text.
-# Check server logs for the throughput number (t/s) in the last line.
-```
+| `--attention-backend flash_attn` | Precompiled attention — avoids broken flashinfer JIT on WSL2 |
+| `--quantization auto_round` | INT4 AutoRound quantization (Lorbus model) |
+| `--gpu-memory-utilization 0.90` | 90% of 96GB for model + cache |
+| `--max-num-seqs 2` | Concurrent request slots (2 for single-user, 4 for multi-user) |
+| `--enable-chunked-prefill` | Prevents long prompts from blocking short ones |
+| `--enable-prefix-caching` | System prompt KV computed once and reused |
+| `--language-model-only` | Skips vision encoder. Saves ~2GB VRAM |
+| `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | MTP speculative decoding — 3 draft tokens per forward pass |
 
 ---
 
-## Bonus Variant — 35B-A3B MoE at ~200 t/s
-
-Same exact recipe, swap the model. The 35B-A3B is a Mixture-of-Experts with 256 total experts and 8 active per token. It uses less memory than you'd think (~35GB in FP8) and the Marlin MoE backend is well-optimized for Blackwell.
+## Step 7 — Systemd service
 
 ```bash
-# Download the MoE variant
-huggingface-cli download Qwen/Qwen3.6-35B-A3B-FP8 \
-  --local-dir ./Qwen3.6-35B-A3B-FP8 \
-  --local-dir-use-symlinks False
-
-# Swap the model path in your startup script
-# Change: --model ~/models/Qwen3.6-27B-FP8
-# To:     --model ~/models/Qwen3.6-35B-A3B-FP8
-# And update: --served-model-name qwen3.6-35b-a3b
-#
-# 256K context fits on 96GB with the MoE too — same --max-model-len 256000 works.
-```
-
-Expected performance: **~200 tok/s** sustained, 256K context. Use this when you want raw throughput. Use the 27B when MoE expert noise is undesirable for your use case (e.g., long coherent prose).
-
----
-
-## Systemd Service (Auto-Start on WSL Boot)
-
-```bash
-sudo tee /etc/systemd/system/vllm.service > /dev/null << 'EOF'
+sudo tee /etc/systemd/system/vllm.service > /dev/null <<'EOF'
 [Unit]
-Description=vLLM OpenAI API Server (Qwen3.6-27B-FP8 + MTP n=3)
+Description=vLLM Qwen3.6-27B INT4-AutoRound + MTP n=3 (Blackwell, ~120 tps)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/YOUR_USER/vllm-setup/start-vllm.sh
+ExecStart=/usr/local/bin/start-vllm.sh
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 StandardOutput=journal
 StandardError=journal
+Environment=HOME=/root
 
 [Install]
 WantedBy=multi-user.target
@@ -300,77 +253,218 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable vllm
 sudo systemctl start vllm
+```
 
-# Check status
-sudo systemctl status vllm
+First boot takes ~90-170s (torch.compile + CUDA graph capture). Subsequent boots: ~40-65s (cached).
+
+```bash
+# Watch startup
+sudo journalctl -u vllm -f
+
+# Look for:
+# "Application startup complete."
+# "Avg generation throughput: 120.0 tokens/s"
 ```
 
 ---
 
-## Performance Validation
+## Step 8 — Verify
 
-Once warm (after ~5–10 requests), check your server logs. You should see lines like:
-
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b",
+    "messages": [{"role": "user", "content": "Say hello and nothing else."}],
+    "max_tokens": 50
+  }'
 ```
-Avg prompt throughput: X tok/s
-Avg generation throughput: 115.4 tok/s
-```
-
-If you're seeing ~40 tok/s or less, MTP is not active. Common causes:
-- Missing the `patch_tolist_cudagraph.py` patch (CUDA graphs failed to capture)
-- `--speculative-config` malformed or missing
-- Model not FP8 (e.g., accidentally downloaded BF16)
-
-If the server crashes on first request with a Triton OOM, the Blackwell TMA patch (Step 5) was not applied correctly.
 
 ---
 
-## What This Setup Is
+## Dual-GPU: 234 tok/s aggregate with nginx LB
 
-This is a **local OpenAI-compatible API server** running on your own GPU. You can point anything that speaks the OpenAI client protocol at `http://localhost:8000/v1`:
+If you have 2x RTX PRO 6000, run two independent replicas behind nginx instead of tensor-parallel. TP=2 adds NCCL all-reduce overhead over PCIe that exceeds the benefit for a 27B model.
 
-- OpenWebUI
-- AnythingLLM
-- Continue.dev
-- Custom scripts via `openai` Python package
+### When to use dual-replica vs single-replica
 
-No cloud dependency, no API keys, no rate limits. Just a workstation with a very large GPU.
+| Scenario | Recommendation | Why |
+|---|---|---|
+| **Single user, parallel API calls** (agents, batch) | **Dual-replica LB** | Spreads your C=4 calls across both GPUs — 234 tok/s aggregate |
+| **Multi-user server** (many independent users) | **Single replica per GPU, high `--max-num-seqs`** | vLLM's continuous batching already parallelizes users; avoids duplicating 17GB model weights + CUDA graph memory on each GPU |
+| **Maximum context length** | **Single replica, `--gpu-memory-utilization 0.95`** | All 96GB for one KV cache pool |
+
+The dual-replica pattern **doubles model memory usage** (17GB x2) and CUDA graph memory. It optimizes for **per-user latency across parallel requests**, not for total multi-user throughput. For a shared server, one replica with `--max-num-seqs 8` on each GPU independently (different ports, no LB) is more efficient.
+
+### Measured results (May 2026)
+
+| Concurrency | Aggregate tok/s | Notes |
+|---|---|---|
+| C=1 | 103-135 | Single stream, routed to one GPU |
+| C=2 | 110-125 | Both GPUs active |
+| C=4 | **198-234** | Sweet spot for agentic tool-call workloads |
+
+### Setup
+
+**1. GPU 1 start script** (copy of main, change GPU and port):
+
+```bash
+sudo cp /usr/local/bin/start-vllm.sh /usr/local/bin/start-vllm-gpu1.sh
+sudo sed -i 's/CUDA_VISIBLE_DEVICES=0/CUDA_VISIBLE_DEVICES=1/' /usr/local/bin/start-vllm-gpu1.sh
+sudo sed -i 's/--port 8000/--port 8001/' /usr/local/bin/start-vllm-gpu1.sh
+```
+
+**2. Systemd unit for replica 2:**
+
+```bash
+sudo tee /etc/systemd/system/vllm-gpu1.service > /dev/null <<'EOF'
+[Unit]
+Description=vLLM replica 2 (GPU 1, port 8001)
+After=network.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/start-vllm-gpu1.sh
+Restart=on-failure
+RestartSec=30
+Environment=HOME=/root
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+```
+
+**3. nginx LB:**
+
+```bash
+sudo apt install -y nginx
+sudo tee /etc/nginx/sites-available/vllm-lb > /dev/null <<'NGINX'
+upstream vllm_pool {
+    least_conn;
+    server 127.0.0.1:8000 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:8001 max_fails=3 fail_timeout=10s;
+}
+server {
+    listen 8400;
+    proxy_read_timeout    900s;
+    proxy_send_timeout    900s;
+    proxy_buffering       off;
+    proxy_request_buffering off;
+    location / {
+        proxy_pass http://vllm_pool;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Accel-Buffering no;
+    }
+}
+NGINX
+sudo ln -sf /etc/nginx/sites-available/vllm-lb /etc/nginx/sites-enabled/vllm-lb
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**4. Start sequentially** (concurrent torch.compile deadlocks on shared CPU):
+
+```bash
+sudo systemctl start vllm        # GPU 0 — wait ~90s
+# ... wait for "Application startup complete" in journal ...
+sudo systemctl start vllm-gpu1   # GPU 1 — ~40s (cached compile)
+```
+
+**5. Hit the LB endpoint:**
+
+```bash
+curl http://localhost:8400/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+```
+
+---
+
+## Troubleshooting
+
+### WSL2 crashes during vLLM startup
+
+**Cause:** `vmIdleTimeout` not set — WSL shuts down 15s after your SSH session ends, killing the vLLM process mid-startup. The next systemd restart triggers a crash loop that can destabilize WSL entirely.
+
+**Fix:** Add `vmIdleTimeout=-1` to `.wslconfig` (see Prerequisites above).
+
+### `RuntimeError: Ninja build failed ... headers are incompatible`
+
+**Cause:** flashinfer JIT compilation is broken on sm_120 with PyPI CUDA 13 fragments. Triggered by `--attention-backend flashinfer` or `--kv-cache-dtype fp8_e5m2`.
+
+**Fix:** Use `--attention-backend flash_attn` and remove `--kv-cache-dtype` (this guide's default).
+
+### `RuntimeError: CUDA driver error: unknown error` at `torch.zeros()`
+
+**Cause:** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set. WSL's CUDA driver can't handle the expandable-segments allocator across fork/spawn.
+
+**Fix:** `unset PYTORCH_CUDA_ALLOC_CONF` — do NOT set this on WSL2.
+
+### `FlashInfer requires GPUs with sm75 or higher`
+
+**Cause:** flashinfer can't detect Blackwell — it falls back to the system CUDA 12.8 nvcc.
+
+**Fix:** Ensure `CUDA_HOME` points at the venv's CUDA 13: `export CUDA_HOME=/opt/vllm-env/lib/python3.12/site-packages/nvidia/cu13`
+
+### Speeds < 50 tok/s — MTP not active
+
+Check: `journalctl -u vllm | grep -E "MTP|SpecDecoding"`
+
+Must see:
+- `Resolved architecture: Qwen3_5MTP`
+- `Detected MTP model. Sharing target model embedding/lm_head weights`
+- `SpecDecoding metrics: Mean acceptance length: N.NN`
+
+### Both replicas fail to start (dual-GPU)
+
+**Cause:** Starting both simultaneously causes torch.compile CPU contention (load avg > 7). Neither finishes compiling.
+
+**Fix:** Always start sequentially — wait for R1 to serve before starting R2.
+
+### Slow first request (~3-5 minutes)
+
+Normal. vLLM AOT-compiles the model graph and caches it at `~/.cache/vllm/torch_compile_cache/`. Second boot skips the compile (~40s startup).
 
 ---
 
 ## Docker (Alternative to Manual Setup)
 
-If you'd rather skip steps 1–8 and get a pre-patched image, the repo includes a Dockerfile and docker-compose that bake in both patches:
+The repo includes a Dockerfile and docker-compose that bake in the working config:
 
 ```bash
-# Clone the repo
 git clone https://github.com/lastloop-ai/vllm-blackwell-guide.git
 cd vllm-blackwell-guide
 
-# Download the model to a local directory
 pip install huggingface-hub
-huggingface-cli download Qwen/Qwen3.6-27B-FP8 \
-  --local-dir ./models/Qwen3.6-27B-FP8 \
+huggingface-cli download Lorbus/Qwen3.6-27B-int4-AutoRound \
+  --local-dir ./models/Qwen3.6-27B-int4-AutoRound \
   --local-dir-use-symlinks False
 
-# Run the 27B variant
 docker compose --profile 27b up -d
-
-# Or the 35B MoE variant (~200 tok/s)
-# huggingface-cli download Qwen/Qwen3.6-35B-A3B-FP8 --local-dir ./models/Qwen3.6-35B-A3B-FP8 --local-dir-use-symlinks False
-# docker compose --profile 35b-moe up -d
 ```
-
-The server is available at `http://localhost:8000/v1`. All flags are configurable via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL` | `/models/Qwen3.6-27B-FP8` | Model path inside the container |
-| `MODEL_NAME` | `qwen3.6-27b` | Name exposed via the API |
-| `MAX_MODEL_LEN` | `131072` | Context length (set to `256000` for 256K) |
-| `GPU_MEM_UTIL` | `0.92` | VRAM fraction (push to `0.97` for 256K) |
+| `MODEL` | `/models/Qwen3.6-27B-int4-AutoRound` | Model path inside container |
+| `MODEL_NAME` | `qwen3.6-27b` | Name exposed via API |
+| `MAX_MODEL_LEN` | `131072` | Context length |
+| `GPU_MEM_UTIL` | `0.90` | VRAM fraction |
 | `NUM_SPEC_TOKENS` | `3` | MTP draft tokens per step |
-| `CUDA_VISIBLE_DEVICES` | `0` | Which GPU to use |
+| `CUDA_VISIBLE_DEVICES` | `0` | Which GPU |
+
+---
+
+## Community Comparison
+
+| Source | Hardware | Config | tok/s | Notes |
+|---|---|---|---|---|
+| **This guide** | 1x RTX PRO 6000 | INT4 + MTP n=3 | **120** | WSL2, flash_attn |
+| **This guide** | 2x RTX PRO 6000 | 2-replica LB, C=4 | **234 agg** | WSL2, nginx |
+| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | 2x RTX 3090 | INT4 + Genesis + MTP n=5 | 100 (single) | Native Linux |
+| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | 2x RTX 3090 | 2-replica LB, C=4 | **225 agg** | Native Linux |
+| [noonghunna](https://github.com/noonghunna/qwen36-27b-single-3090) | RTX 3090 | INT4 + Genesis + MTP n=3 | 50-70 | Single 3090 |
+| [CobraPhil](https://github.com/CobraPhil/qwen36-27b-single-5090) | RTX 5090 | INT4 + Genesis + MTP n=3 | ~160 | Blackwell 32GB |
+| [Sandermage/Genesis](https://github.com/Sandermage/genesis-vllm-patches) | 2x A5000 | INT4 + TQ k8v4 + MTP n=3 | 103 | Patch framework |
 
 ---
 
@@ -378,13 +472,15 @@ The server is available at `http://localhost:8000/v1`. All flags are configurabl
 
 This recipe builds on work from several people:
 
-- [u/Kindly-Cantaloupe978](https://www.reddit.com/r/LocalLLaMA/comments/1sv8eua/qwen3627b_at_80_tps_with_218k_context_window_on/) — original 80 t/s recipe on RTX 3090
-- [Wasif Basharat's Medium write-up](https://medium.com/@fzbcwvv/an-overnight-stack-for-qwen3-6-27b-85-tps-125k-context-vision-on-one-rtx-3090-0d95c6291914) — 85 t/s overnight stack, documented the `.tolist()` CUDA graph bug
+- [u/Kindly-Cantaloupe978](https://www.reddit.com/r/LocalLLaMA/comments/1sv8eua/) — original 80 t/s recipe on RTX 3090
+- [Wasif Basharat's Medium write-up](https://medium.com/@fzbcwvv/an-overnight-stack-for-qwen3-6-27b-85-tps-125k-context-vision-on-one-rtx-3090-0d95c6291914) — documented the `.tolist()` CUDA graph bug
 - [noonghunna/qwen36-27b-single-3090](https://github.com/noonghunna/qwen36-27b-single-3090) — the `patch_tolist_cudagraph.py` patch
+- [Alexander Ollman](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) — dual-3090 benchmark methodology, 225 t/s aggregate
+- [Sandermage/genesis-vllm-patches](https://github.com/Sandermage/genesis-vllm-patches) — runtime patching framework for vLLM
 - The vLLM team for [PR #36325](https://github.com/vllm-project/vllm/pull/36325) (Blackwell TMA fix)
 
-What I added: adapted the 24GB/3090 recipes to the 96GB RTX PRO 6000 where FP8 + MTP n=3 just fits without the OOM workarounds the smaller cards need.
+What I added: identified the flashinfer JIT root cause on WSL2 (`flash_attn` workaround), WSL2 vmIdleTimeout fix, dual-replica nginx LB recipe, and empirical benchmark data across 5 configs.
 
 ---
 
-*Questions or issues, drop them below.*
+*Tested May 2026. Questions or issues, [open an issue](https://github.com/lastloop-ai/vllm-blackwell-guide/issues).*
