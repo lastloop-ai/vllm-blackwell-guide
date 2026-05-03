@@ -12,7 +12,8 @@ All numbers measured on RTX PRO 6000 Blackwell (96GB, 1792 GB/s), 3+ runs of 102
 |---|---|---|---|
 | Eager mode, no MTP, no CUDA graphs | 1x RTX PRO 6000 | **24** | Bandwidth floor |
 | CUDA graphs + flash_attn, no MTP | 1x RTX PRO 6000 | **75** | 3.1x — matches 1792 GB/s theory |
-| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **This guide's default** |
+| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **27B Dense, INT4** |
+| CUDA graphs + flash_attn + MTP n=3 | 1x RTX PRO 6000 | **200** | **35B-A3B MoE, FP8** |
 | CUDA graphs + flash_attn + MTP n=5 | 1x RTX PRO 6000 | **125** | +4% over n=3, marginal |
 
 MTP speculative decoding metrics: mean acceptance length 3.19, per-position acceptance 0.87/0.72/0.60, avg draft acceptance 73%.
@@ -132,15 +133,37 @@ snapshot_download(
 "
 ```
 
+### GPU 1 — 35B-A3B MoE FP8 (optional)
+
+The MoE variant delivers ~200 t/s on the second GPU. Requires the official
+FP8 model (the GPTQ-Int4 quant lacks MTP weights):
+
+```bash
+sudo mkdir -p /opt/models
+export HF_TOKEN=hf_xxxxxxxxxx
+sudo HF_TOKEN=$HF_TOKEN /opt/vllm-env/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='Qwen/Qwen3.6-35B-A3B-FP8',
+    local_dir='/opt/models/Qwen3.6-35B-A3B-FP8',
+    max_workers=4,
+)
+"
+```
+
 ### Model choice guide
 
 | Variant | Size | Speed (with MTP) | When to use |
 |---|---|---|---|
 | `Lorbus/Qwen3.6-27B-int4-AutoRound` | 19 GB | **120 t/s** | **Default — best speed/quality on 96GB** |
-| `Qwen/Qwen3.6-27B-FP8` | 31 GB | ~80 t/s (no MTP)* | Near-lossless quality, lower speed |
-| `Qwen/Qwen3.6-35B-A3B-FP8` | 35 GB | ~200 t/s | MoE — highest throughput |
+| `Qwen/Qwen3.6-35B-A3B-FP8` | 35 GB | **200 t/s** | MoE — highest throughput |
+| `Qwen/Qwen3.6-27B-FP8` | 38 GB | ~80 t/s (no MTP)* | Near-lossless quality, lower speed |
 
-*FP8 with MTP on WSL2 is blocked by the flashinfer JIT bug (see below).
+*FP8 27B with MTP on WSL2 is blocked by the flashinfer JIT bug (see below).
+The MoE FP8 works because its attention pattern avoids the problematic kernel.
+
+**Do NOT use the GPTQ-Int4 MoE** — it lacks MTP weights (mtp_num_layers
+missing from config.json) and crashes with speculative decoding.
 
 ---
 
@@ -288,13 +311,31 @@ If you have 2x Blackwell GPUs, run one independent vLLM instance per GPU behind 
 
 Each GPU runs its own full vLLM server with `--max-num-seqs 8`. vLLM's continuous batching handles concurrency within each instance. A lightweight bridge in front routes requests to the least-loaded GPU and handles health checking.
 
-### GPU 1 instance
+### GPU 1 instance (35B FP8 MoE)
 
 ```bash
-# Copy the GPU 0 start script, change GPU index and port
-sudo cp /usr/local/bin/start-vllm.sh /usr/local/bin/start-vllm-gpu1.sh
-sudo sed -i 's/CUDA_VISIBLE_DEVICES=0/CUDA_VISIBLE_DEVICES=1/' /usr/local/bin/start-vllm-gpu1.sh
-sudo sed -i 's/--port 8000/--port 8001/' /usr/local/bin/start-vllm-gpu1.sh
+# GPU 1 runs the FP8 MoE with MTP n=3. Create a separate start script:
+sudo tee /usr/local/bin/start-vllm-gpu1.sh > /dev/null <<'VLLM'
+#!/bin/bash
+set -euo pipefail
+# ... same env vars as GPU 0 but CUDA_VISIBLE_DEVICES=1 ...
+exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
+  --model /opt/models/Qwen3.6-35B-A3B-FP8 \
+  --served-model-name qwen3.6-35b-a3b \
+  --host 127.0.0.1 --port 8001 \
+  --trust-remote-code \
+  --dtype auto \
+  --attention-backend flash_attn \
+  --max-model-len 262144 \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 8 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --language-model-only \
+  --skip-mm-profiling \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+VLLM
+sudo chmod +x /usr/local/bin/start-vllm-gpu1.sh
 ```
 
 ### Systemd unit for GPU 1 (sequential start)
@@ -465,10 +506,11 @@ docker compose --profile dual-gpu up -d
 ## Community Comparison
 
 | Source | Hardware | Config | tok/s (per GPU) | Notes |
-|---|---|---|---|---|
-| **This guide** | RTX PRO 6000 96GB | INT4 + MTP n=3, `max-num-seqs 8` | **120** | WSL2, flash_attn, multi-user |
-| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | RTX 3090 24GB | INT4 + Genesis + MTP n=5 | 100 | Native Linux |
+|---|---|---|
+| **This guide** | RTX PRO 6000 96GB | 27B INT4 + MTP n=3 | **120** | WSL2, flash_attn |
+| **This guide** | RTX PRO 6000 96GB | 35B FP8 MoE + MTP n=3 | **200** | WSL2, flash_attn |
 | [CobraPhil](https://github.com/CobraPhil/qwen36-27b-single-5090) | RTX 5090 32GB | INT4 + Genesis + MTP n=3 | ~160 | Blackwell 32GB |
+| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | RTX 3090 24GB | INT4 + Genesis + MTP n=5 | 100 | Native Linux |
 | [noonghunna](https://github.com/noonghunna/qwen36-27b-single-3090) | RTX 3090 24GB | INT4 + Genesis + MTP n=3 | 50-70 | Single 3090 |
 | [Sandermage/Genesis](https://github.com/Sandermage/genesis-vllm-patches) | 2x A5000 40GB | INT4 + TQ k8v4 + MTP n=3 | 103 | Patch framework |
 
