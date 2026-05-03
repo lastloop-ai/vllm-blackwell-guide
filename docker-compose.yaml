@@ -1,0 +1,88 @@
+# Docker Compose for vLLM on Blackwell GPUs
+#
+# Default: multi-user throughput (one instance per GPU, max-num-seqs=8)
+# Each GPU instance handles 8 concurrent users via vLLM continuous batching.
+#
+# Usage:
+#   docker compose up -d                    # Single GPU (GPU 0)
+#   docker compose --profile dual-gpu up -d # Both GPUs + bridge LB
+
+services:
+  # GPU 0 — primary instance
+  vllm-gpu0:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - VLLM_URL=unused  # native vLLM, not a bridge
+      - MODEL=${MODEL:-/models/Qwen3.6-27B-int4-AutoRound}
+      - MODEL_NAME=${MODEL_NAME:-qwen3.6-27b}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+      - GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
+      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+      - NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    restart: unless-stopped
+    labels:
+      lastloop.service.name: "vllm-gpu0"
+      lastloop.service.port: "8000"
+      lastloop.service.description: "vLLM GPU 0 — Qwen3.6 27B INT4+MTP (~120 tps, 128k ctx)"
+
+  # GPU 1 — second instance (dual-gpu profile)
+  vllm-gpu1:
+    build: .
+    profiles: ["dual-gpu"]
+    ports:
+      - "8001:8001"
+    environment:
+      - PORT=8001
+      - VLLM_URL=unused
+      - MODEL=${MODEL:-/models/Qwen3.6-27B-int4-AutoRound}
+      - MODEL_NAME=${MODEL_NAME:-qwen3.6-27b}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+      - GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
+      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+      - NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
+      - CUDA_VISIBLE_DEVICES=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    restart: unless-stopped
+    depends_on:
+      vllm-gpu0:
+        condition: service_healthy
+    labels:
+      lastloop.service.name: "vllm-gpu1"
+      lastloop.service.port: "8001"
+      lastloop.service.description: "vLLM GPU 1 — Qwen3.6 27B INT4+MTP (~120 tps, 128k ctx)"
+
+  # Bridge — health-aware LB across GPU instances
+  vllm-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    profiles: ["dual-gpu"]
+    ports:
+      - "8098:8098"
+    environment:
+      - PORT=8098
+      - VLLM_BACKENDS=http://vllm-gpu0:8000,http://vllm-gpu1:8001
+    restart: unless-stopped
+    depends_on:
+      - vllm-gpu0
+    labels:
+      lastloop.service.name: "vllm-bridge"
+      lastloop.service.port: "8098"
+      lastloop.service.description: "vLLM Bridge — health-aware LB + SSE streaming"

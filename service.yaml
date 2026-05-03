@@ -1,0 +1,66 @@
+apiVersion: lastloop.xyz/v1
+kind: ServiceManifest
+
+metadata:
+  name: vllm-bridge
+  displayName: vLLM Bridge — Qwen 3.6 27B (Blackwell)
+  description: >
+    Health-aware load-balancing bridge for vLLM instances running
+    Qwen 3.6 27B INT4-AutoRound + MTP n=3 on Blackwell GPUs.
+    One vLLM instance per GPU, each serving 8 concurrent users via
+    continuous batching. Bridge routes to least-loaded GPU.
+    ~120 tok/s per GPU, 128K context. OpenAI-compatible API.
+  owner: clemens
+  repository: https://github.com/lastloop-ai/vllm-blackwell-guide
+  tags:
+    - llm-inference
+    - local
+    - vllm
+    - federated
+    - qwen3.6
+    - blackwell
+
+spec:
+  type: federated-local
+  lifecycle: stateless
+
+  interfaces:
+    - protocol: http
+      port: 8098
+      audience: agent
+      endpoints:
+        - path: /v1/chat/completions
+          method: POST
+          description: OpenAI-compatible chat completions (streaming + non-streaming)
+        - path: /v1/completions
+          method: POST
+          description: OpenAI-compatible text completions
+        - path: /v1/models
+          method: GET
+          description: List loaded models
+        - path: /health
+          method: GET
+          description: Per-backend health status with active request counts
+
+  technologies:
+    runtime:
+      - go
+      - vllm
+      - python
+
+  docs:
+    readme: README.md
+
+  quickstart:
+    setup: |
+      1. Follow the README to install vLLM on WSL2 / Linux
+      2. Start GPU 0: systemctl start vllm
+      3. Start GPU 1: systemctl start vllm-gpu1  (waits for GPU 0)
+      4. Start bridge: systemctl start vllm-bridge
+      5. SSH tunnel from your machine: ssh -L 8098:localhost:8098 stud2-wsl
+    verify: |
+      curl http://localhost:8098/health
+    example: |
+      curl http://localhost:8098/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'

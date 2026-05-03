@@ -1,0 +1,8 @@
+FROM golang:1.23-alpine AS builder
+WORKDIR /build
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o vllm-bridge .
+
+FROM scratch
+COPY --from=builder /build/vllm-bridge /vllm-bridge
+ENTRYPOINT ["/vllm-bridge"]

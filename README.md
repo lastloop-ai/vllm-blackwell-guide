@@ -1,4 +1,4 @@
-# Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s (27B) / 234 t/s (dual-GPU LB), step by step
+# Qwen3.6 on RTX PRO 6000 Blackwell — 120 t/s per GPU, step by step
 
 Qwen3.6 27B runs well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + MTP speculative decoding to actually work on sm_120 in WSL2 requires workarounds that aren't documented anywhere in one place. This is that guide — from a fresh WSL2 install to a working OpenAI-compatible API server. Tested on WSL2; bare-metal Linux should be identical or faster.
 
@@ -6,17 +6,18 @@ Qwen3.6 27B runs well on the RTX PRO 6000 Blackwell (96GB), but getting vLLM + M
 
 ## The Numbers (empirically verified, May 2026)
 
-All numbers measured on RTX PRO 6000 Blackwell (96GB, 1792 GB/s), 3 runs of 1024 output tokens each:
+All numbers measured on RTX PRO 6000 Blackwell (96GB, 1792 GB/s), 3+ runs of 1024 output tokens each:
 
-| Config | Hardware | t/s | Notes |
+| Config | Hardware | t/s per GPU | Notes |
 |---|---|---|---|
-| Eager mode, no MTP, no CUDA graphs | 1x RTX PRO 6000 | **24** | Bandwidth floor (dispatch overhead dominates) |
-| CUDA graphs + flash_attn, no MTP | 1x RTX PRO 6000 | **75** | 3.1x over eager — matches 1792 GB/s theory |
-| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **This guide's target config** |
-| CUDA graphs + flash_attn + MTP n=5 | 1x RTX PRO 6000 | **125** | +4% over n=3, marginal gain |
-| **Dual-replica nginx LB, C=4** | **2x RTX PRO 6000** | **234 aggregate** | **Two independent servers, no NCCL** |
+| Eager mode, no MTP, no CUDA graphs | 1x RTX PRO 6000 | **24** | Bandwidth floor |
+| CUDA graphs + flash_attn, no MTP | 1x RTX PRO 6000 | **75** | 3.1x — matches 1792 GB/s theory |
+| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **This guide's default** |
+| CUDA graphs + flash_attn + MTP n=5 | 1x RTX PRO 6000 | **125** | +4% over n=3, marginal |
 
 MTP speculative decoding metrics: mean acceptance length 3.19, per-position acceptance 0.87/0.72/0.60, avg draft acceptance 73%.
+
+**Multi-GPU:** Each GPU runs its own independent vLLM instance with `--max-num-seqs 8`. With 2x RTX PRO 6000, that's two independent servers handling 8 concurrent users each — no NCCL, no tensor parallel, no shared state. vLLM's continuous batching handles concurrency within each GPU. A lightweight bridge in front does health-aware least-connections routing.
 
 ### Bandwidth parity note
 
@@ -177,15 +178,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=8
 exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
   --model /opt/models/Qwen3.6-27B-int4-AutoRound \
   --served-model-name qwen3.6-27b \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
   --quantization auto_round \
   --attention-backend flash_attn \
-  --performance-mode interactivity \
   --max-model-len 131072 \
-  --gpu-memory-utilization 0.90 \
-  --max-num-seqs 2 \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 8 \
   --skip-mm-profiling \
   --enable-prefix-caching \
   --enable-chunked-prefill \
@@ -220,10 +220,10 @@ If you have the **full system CUDA 13 toolkit** (`apt install cuda-toolkit-13-0`
 |------|--------------|
 | `--attention-backend flash_attn` | Precompiled attention — avoids broken flashinfer JIT on WSL2 |
 | `--quantization auto_round` | INT4 AutoRound quantization (Lorbus model) |
-| `--gpu-memory-utilization 0.90` | 90% of 96GB for model + cache |
-| `--max-num-seqs 2` | Concurrent request slots (2 for single-user, 4 for multi-user) |
-| `--enable-chunked-prefill` | Prevents long prompts from blocking short ones |
-| `--enable-prefix-caching` | System prompt KV computed once and reused |
+| `--gpu-memory-utilization 0.92` | 92% of 96GB for model + cache |
+| `--max-num-seqs 8` | Concurrent request slots. vLLM's continuous batching interleaves decode across all 8. Increase to 16 for heavier multi-user loads; decrease to 2 for single-user lowest-latency |
+| `--enable-chunked-prefill` | Splits long prefills into chunks interleaved with generation — prevents one long prompt from blocking short ones |
+| `--enable-prefix-caching` | KV for identical prompt prefixes computed once and reused across requests. Huge win when many users share the same system prompt |
 | `--language-model-only` | Skips vision encoder. Saves ~2GB VRAM |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | MTP speculative decoding — 3 draft tokens per forward pass |
 
@@ -282,101 +282,104 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
-## Dual-GPU: 234 tok/s aggregate with nginx LB
+## Dual-GPU: One Instance Per GPU
 
-If you have 2x RTX PRO 6000, run two independent replicas behind nginx instead of tensor-parallel. TP=2 adds NCCL all-reduce overhead over PCIe that exceeds the benefit for a 27B model.
+If you have 2x Blackwell GPUs, run one independent vLLM instance per GPU behind a bridge/load-balancer. **Do not use tensor-parallel (TP=2)** — NCCL all-reduce over PCIe adds more latency than it saves for a 27B model.
 
-### When to use dual-replica vs single-replica
+Each GPU runs its own full vLLM server with `--max-num-seqs 8`. vLLM's continuous batching handles concurrency within each instance. A lightweight bridge in front routes requests to the least-loaded GPU and handles health checking.
 
-| Scenario | Recommendation | Why |
-|---|---|---|
-| **Single user, parallel API calls** (agents, batch) | **Dual-replica LB** | Spreads your C=4 calls across both GPUs — 234 tok/s aggregate |
-| **Multi-user server** (many independent users) | **Single replica per GPU, high `--max-num-seqs`** | vLLM's continuous batching already parallelizes users; avoids duplicating 17GB model weights + CUDA graph memory on each GPU |
-| **Maximum context length** | **Single replica, `--gpu-memory-utilization 0.95`** | All 96GB for one KV cache pool |
-
-The dual-replica pattern **doubles model memory usage** (17GB x2) and CUDA graph memory. It optimizes for **per-user latency across parallel requests**, not for total multi-user throughput. For a shared server, one replica with `--max-num-seqs 8` on each GPU independently (different ports, no LB) is more efficient.
-
-### Measured results (May 2026)
-
-| Concurrency | Aggregate tok/s | Notes |
-|---|---|---|
-| C=1 | 103-135 | Single stream, routed to one GPU |
-| C=2 | 110-125 | Both GPUs active |
-| C=4 | **198-234** | Sweet spot for agentic tool-call workloads |
-
-### Setup
-
-**1. GPU 1 start script** (copy of main, change GPU and port):
+### GPU 1 instance
 
 ```bash
+# Copy the GPU 0 start script, change GPU index and port
 sudo cp /usr/local/bin/start-vllm.sh /usr/local/bin/start-vllm-gpu1.sh
 sudo sed -i 's/CUDA_VISIBLE_DEVICES=0/CUDA_VISIBLE_DEVICES=1/' /usr/local/bin/start-vllm-gpu1.sh
 sudo sed -i 's/--port 8000/--port 8001/' /usr/local/bin/start-vllm-gpu1.sh
 ```
 
-**2. Systemd unit for replica 2:**
+### Systemd unit for GPU 1 (sequential start)
+
+GPU 1's service waits for GPU 0 to be healthy before starting. This prevents concurrent `torch.compile` from deadlocking on shared CPU (load avg > 7 when both compile simultaneously).
 
 ```bash
 sudo tee /etc/systemd/system/vllm-gpu1.service > /dev/null <<'EOF'
 [Unit]
-Description=vLLM replica 2 (GPU 1, port 8001)
-After=network.target
+Description=vLLM GPU 1 — Qwen3.6-27B INT4 + MTP n=3
+After=vllm.service
+
 [Service]
 Type=simple
+# Wait for GPU 0 to finish booting before starting GPU 1
+ExecStartPre=/bin/bash -c 'until curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 5; done'
 ExecStart=/usr/local/bin/start-vllm-gpu1.sh
 Restart=on-failure
 RestartSec=30
 Environment=HOME=/root
+
 [Install]
 WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
+sudo systemctl enable vllm-gpu1
 ```
 
-**3. nginx LB:**
+### Bridge (replaces nginx)
+
+This repo includes a Go bridge binary (`vllm-bridge`) that runs inside WSL2 alongside vLLM. It replaces nginx with built-in:
+- **Least-connections load balancing** across both GPU instances
+- **Per-backend health tracking** with 10s probe interval
+- **SSE streaming support** (flush every chunk, no write timeout)
+- **Retry on transient errors** for GET requests
 
 ```bash
-sudo apt install -y nginx
-sudo tee /etc/nginx/sites-available/vllm-lb > /dev/null <<'NGINX'
-upstream vllm_pool {
-    least_conn;
-    server 127.0.0.1:8000 max_fails=3 fail_timeout=10s;
-    server 127.0.0.1:8001 max_fails=3 fail_timeout=10s;
-}
-server {
-    listen 8400;
-    proxy_read_timeout    900s;
-    proxy_send_timeout    900s;
-    proxy_buffering       off;
-    proxy_request_buffering off;
-    location / {
-        proxy_pass http://vllm_pool;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header X-Accel-Buffering no;
-    }
-}
-NGINX
-sudo ln -sf /etc/nginx/sites-available/vllm-lb /etc/nginx/sites-enabled/vllm-lb
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t && sudo systemctl reload nginx
+# Install the bridge binary
+sudo cp vllm-bridge /usr/local/bin/vllm-bridge
+sudo chmod +x /usr/local/bin/vllm-bridge
+
+# Systemd unit
+sudo tee /etc/systemd/system/vllm-bridge.service > /dev/null <<'EOF'
+[Unit]
+Description=vLLM Bridge — health-aware LB + SSE streaming
+After=vllm.service
+Wants=vllm.service vllm-gpu1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vllm-bridge
+Environment=PORT=8098
+Environment=VLLM_BACKENDS=http://127.0.0.1:8000,http://127.0.0.1:8001
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable vllm-bridge
 ```
 
-**4. Start sequentially** (concurrent torch.compile deadlocks on shared CPU):
+### Start everything
 
 ```bash
-sudo systemctl start vllm        # GPU 0 — wait ~90s
-# ... wait for "Application startup complete" in journal ...
-sudo systemctl start vllm-gpu1   # GPU 1 — ~40s (cached compile)
+sudo systemctl start vllm          # GPU 0 — ~90s first boot, ~40s cached
+sudo systemctl start vllm-gpu1     # GPU 1 — waits for GPU 0, then ~40s
+sudo systemctl start vllm-bridge   # Bridge — waits for at least one backend
 ```
 
-**5. Hit the LB endpoint:**
+### Hit the bridge
 
 ```bash
-curl http://localhost:8400/v1/chat/completions \
+curl http://localhost:8098/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+
+# Check backend health
+curl http://localhost:8098/health
 ```
+
+### Single-user low-latency variant
+
+If you're a single user firing parallel API calls (agent tool calls, batch processing), you can also run two replicas of the same model behind the bridge. This trades memory efficiency for per-request parallelism — your C=4 requests are spread across GPUs instead of queued. Measured: **234 tok/s aggregate at C=4** with this pattern. The downside: model weights are loaded twice (17GB x2). For most use cases, the default one-instance-per-GPU with `--max-num-seqs 8` is better.
 
 ---
 
@@ -429,18 +432,23 @@ Normal. vLLM AOT-compiles the model graph and caches it at `~/.cache/vllm/torch_
 
 ## Docker (Alternative to Manual Setup)
 
-The repo includes a Dockerfile and docker-compose that bake in the working config:
+The repo includes Dockerfiles and docker-compose for both single-GPU and dual-GPU setups:
 
 ```bash
 git clone https://github.com/lastloop-ai/vllm-blackwell-guide.git
 cd vllm-blackwell-guide
 
+# Download model
 pip install huggingface-hub
 huggingface-cli download Lorbus/Qwen3.6-27B-int4-AutoRound \
   --local-dir ./models/Qwen3.6-27B-int4-AutoRound \
   --local-dir-use-symlinks False
 
-docker compose --profile 27b up -d
+# Single GPU
+docker compose up -d
+
+# Dual GPU (both GPUs + bridge LB)
+docker compose --profile dual-gpu up -d
 ```
 
 | Variable | Default | Description |
@@ -448,23 +456,21 @@ docker compose --profile 27b up -d
 | `MODEL` | `/models/Qwen3.6-27B-int4-AutoRound` | Model path inside container |
 | `MODEL_NAME` | `qwen3.6-27b` | Name exposed via API |
 | `MAX_MODEL_LEN` | `131072` | Context length |
-| `GPU_MEM_UTIL` | `0.90` | VRAM fraction |
+| `GPU_MEM_UTIL` | `0.92` | VRAM fraction |
+| `MAX_NUM_SEQS` | `8` | Concurrent request slots per GPU |
 | `NUM_SPEC_TOKENS` | `3` | MTP draft tokens per step |
-| `CUDA_VISIBLE_DEVICES` | `0` | Which GPU |
 
 ---
 
 ## Community Comparison
 
-| Source | Hardware | Config | tok/s | Notes |
+| Source | Hardware | Config | tok/s (per GPU) | Notes |
 |---|---|---|---|---|
-| **This guide** | 1x RTX PRO 6000 | INT4 + MTP n=3 | **120** | WSL2, flash_attn |
-| **This guide** | 2x RTX PRO 6000 | 2-replica LB, C=4 | **234 agg** | WSL2, nginx |
-| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | 2x RTX 3090 | INT4 + Genesis + MTP n=5 | 100 (single) | Native Linux |
-| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | 2x RTX 3090 | 2-replica LB, C=4 | **225 agg** | Native Linux |
-| [noonghunna](https://github.com/noonghunna/qwen36-27b-single-3090) | RTX 3090 | INT4 + Genesis + MTP n=3 | 50-70 | Single 3090 |
-| [CobraPhil](https://github.com/CobraPhil/qwen36-27b-single-5090) | RTX 5090 | INT4 + Genesis + MTP n=3 | ~160 | Blackwell 32GB |
-| [Sandermage/Genesis](https://github.com/Sandermage/genesis-vllm-patches) | 2x A5000 | INT4 + TQ k8v4 + MTP n=3 | 103 | Patch framework |
+| **This guide** | RTX PRO 6000 96GB | INT4 + MTP n=3, `max-num-seqs 8` | **120** | WSL2, flash_attn, multi-user |
+| [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | RTX 3090 24GB | INT4 + Genesis + MTP n=5 | 100 | Native Linux |
+| [CobraPhil](https://github.com/CobraPhil/qwen36-27b-single-5090) | RTX 5090 32GB | INT4 + Genesis + MTP n=3 | ~160 | Blackwell 32GB |
+| [noonghunna](https://github.com/noonghunna/qwen36-27b-single-3090) | RTX 3090 24GB | INT4 + Genesis + MTP n=3 | 50-70 | Single 3090 |
+| [Sandermage/Genesis](https://github.com/Sandermage/genesis-vllm-patches) | 2x A5000 40GB | INT4 + TQ k8v4 + MTP n=3 | 103 | Patch framework |
 
 ---
 
@@ -479,7 +485,7 @@ This recipe builds on work from several people:
 - [Sandermage/genesis-vllm-patches](https://github.com/Sandermage/genesis-vllm-patches) — runtime patching framework for vLLM
 - The vLLM team for [PR #36325](https://github.com/vllm-project/vllm/pull/36325) (Blackwell TMA fix)
 
-What I added: identified the flashinfer JIT root cause on WSL2 (`flash_attn` workaround), WSL2 vmIdleTimeout fix, dual-replica nginx LB recipe, and empirical benchmark data across 5 configs.
+What I added: identified the flashinfer JIT root cause on WSL2 (`flash_attn` workaround), WSL2 `vmIdleTimeout` fix, multi-GPU architecture with health-aware bridge (replaces nginx), sequential startup to avoid torch.compile deadlock, and empirical benchmark data across 5 configs.
 
 ---
 
