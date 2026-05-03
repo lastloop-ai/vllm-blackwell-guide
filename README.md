@@ -12,8 +12,8 @@ All numbers measured on RTX PRO 6000 Blackwell (96GB, 1792 GB/s), 3+ runs of 102
 |---|---|---|---|
 | Eager mode, no MTP, no CUDA graphs | 1x RTX PRO 6000 | **24** | Bandwidth floor |
 | CUDA graphs + flash_attn, no MTP | 1x RTX PRO 6000 | **75** | 3.1x — matches 1792 GB/s theory |
-| **CUDA graphs + flash_attn + MTP n=3** | **1x RTX PRO 6000** | **120** | **27B Dense, INT4** |
-| CUDA graphs + flash_attn + MTP n=3 | 1x RTX PRO 6000 | **200** | **35B-A3B MoE, FP8** |
+| **CUDA graphs + flashinfer + MTP n=3 + FP8 KV** | **1x RTX PRO 6000** | **100** | **27B Dense, INT4, 2x KV capacity** |
+| CUDA graphs + flashinfer + MTP n=3 + FP8 KV | 1x RTX PRO 6000 | **170** | **35B-A3B MoE, FP8, 2x KV capacity** |
 | CUDA graphs + flash_attn + MTP n=5 | 1x RTX PRO 6000 | **125** | +4% over n=3, marginal |
 
 MTP speculative decoding metrics: mean acceptance length 3.19, per-position acceptance 0.87/0.72/0.60, avg draft acceptance 73%.
@@ -30,7 +30,7 @@ The RTX PRO 6000 and RTX 5090 share **identical memory bandwidth** (1792 GB/s, 5
 
 - RTX PRO 6000 Blackwell (96GB) or RTX 5090 (32GB — use INT4 quant instead of FP8)
 - Windows 11 + WSL2 with Ubuntu 24.04 (tested; bare-metal Linux should be identical)
-- ~25GB free disk space for the INT4 model, ~40GB for FP8
+- ~25GB free disk for 27B INT4, ~35GB for 35B FP8 MoE, ~5GB for CUDA 13 toolkit
 - Basic comfort with the terminal
 
 ### CRITICAL: Prevent WSL2 auto-shutdown
@@ -87,9 +87,9 @@ sudo /opt/vllm-env/bin/pip install --upgrade pip wheel
 
 ---
 
-## Step 4 — Install vLLM nightly + CUDA 13
+## Step 4 — Install vLLM nightly
 
-The stable vLLM 0.19.1 has a WSL2 MTP bug (CUDA driver error during subprocess fork). Use the nightly:
+The stable vLLM 0.19.1 has a WSL2 MTP bug. Use the nightly:
 
 ```bash
 WHEEL=$(curl -s "https://wheels.vllm.ai/nightly/cu130/vllm/" \
@@ -98,9 +98,6 @@ WHEEL=$(curl -s "https://wheels.vllm.ai/nightly/cu130/vllm/" \
 URL="https://wheels.vllm.ai/nightly/cu130/vllm/${WHEEL}"
 echo "Installing $URL"
 sudo /opt/vllm-env/bin/pip install --upgrade "$URL"
-
-# Add CUDA 13 dev pieces for flashinfer
-sudo /opt/vllm-env/bin/pip install nvidia-cuda-nvcc nvidia-cuda-cccl
 ```
 
 ### Sanity check
@@ -116,9 +113,24 @@ print(f'sm      {torch.cuda.get_device_capability(0)}')
 "
 ```
 
+## Step 5 — Install system CUDA 13 toolkit (enables FP8 KV cache)
+
+The PyPI CUDA 13 fragments aren't sufficient for flashinfer JIT compilation
+on Blackwell. Install the full toolkit:
+
+```bash
+sudo apt install -y cuda-nvcc-13-0 cuda-cccl-13-0 cuda-cudart-dev-13-0
+```
+
+Verify:
+
+```bash
+/usr/local/cuda-13.0/bin/nvcc --version
+```
+
 ---
 
-## Step 5 — Download the model
+## Step 6 — Download the model
 
 ```bash
 sudo mkdir -p /opt/models
@@ -153,50 +165,36 @@ snapshot_download(
 
 ### Model choice guide
 
-| Variant | Size | Speed (with MTP) | When to use |
+| Variant | Size | Speed (with MTP+FP8 KV) | When to use |
 |---|---|---|---|
-| `Lorbus/Qwen3.6-27B-int4-AutoRound` | 19 GB | **120 t/s** | **Default — best speed/quality on 96GB** |
-| `Qwen/Qwen3.6-35B-A3B-FP8` | 35 GB | **200 t/s** | MoE — highest throughput |
-| `Qwen/Qwen3.6-27B-FP8` | 38 GB | ~80 t/s (no MTP)* | Near-lossless quality, lower speed |
+| `Lorbus/Qwen3.6-27B-int4-AutoRound` | 19 GB | **100 t/s** | Default — GPU 0 |
+| `Qwen/Qwen3.6-35B-A3B-FP8` | 35 GB | **170 t/s** | MoE — GPU 1 |
 
-*FP8 27B with MTP on WSL2 is blocked by the flashinfer JIT bug (see below).
-The MoE FP8 works because its attention pattern avoids the problematic kernel.
-
-**Do NOT use the GPTQ-Int4 MoE** — it lacks MTP weights (mtp_num_layers
-missing from config.json) and crashes with speculative decoding.
+All numbers with flashinfer + FP8 KV cache. For maximum single-user speed,
+use `flash_attn` (no FP8 KV): 115 t/s (27B) / 200 t/s (35B).
 
 ---
 
-## Step 6 — Create the startup script
+## Step 7 — Create the startup script
 
 ```bash
 sudo tee /usr/local/bin/start-vllm.sh > /dev/null <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
-# CRITICAL: Don't put /usr/local/cuda/bin in PATH if it's CUDA 12.8.
-export PATH=/usr/bin:/usr/sbin
-export CUDA_HOME=/opt/vllm-env/lib/python3.12/site-packages/nvidia/cu13
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64
+# With system CUDA 13, flashinfer JIT compiles correctly. FP8 KV cache
+# halves memory per token — 2x the concurrent users at 256K context.
+export PATH=/usr/local/cuda-13.0/bin:/usr/bin:/usr/sbin
+export CUDA_HOME=/usr/local/cuda-13.0
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}
 
 export CUDA_VISIBLE_DEVICES=0
-export FLASHINFER_CUDA_ARCH_LIST="12.0"
-export TORCH_CUDA_ARCH_LIST="12.0"
-
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_FLOAT32_MATMUL_PRECISION=high
-export VLLM_MARLIN_USE_ATOMIC_ADD=1
 export NCCL_CUMEM_ENABLE=0
 export NCCL_P2P_DISABLE=1
 export OMP_NUM_THREADS=1
 export CUDA_DEVICE_MAX_CONNECTIONS=8
-
-# CRITICAL: Do NOT set these on WSL2:
-# - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (breaks MTP subprocess)
-# - VLLM_USE_FLASHINFER_SAMPLER=1 (JIT fails on sm_120)
-# - --kv-cache-dtype fp8_e5m2 (triggers broken flashinfer JIT during CUDA graph capture)
-# - --attention-backend flashinfer (CCCL header incompatibility on PyPI CUDA 13)
 
 exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
   --model /opt/models/Qwen3.6-27B-int4-AutoRound \
@@ -205,7 +203,8 @@ exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
   --port 8000 \
   --trust-remote-code \
   --quantization auto_round \
-  --attention-backend flash_attn \
+  --attention-backend flashinfer \
+  --kv-cache-dtype fp8_e4m3 \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 8 \
@@ -222,37 +221,56 @@ EOF
 sudo chmod +x /usr/local/bin/start-vllm.sh
 ```
 
-### Why `flash_attn` not `flashinfer`
+### Why `flashinfer` not `flash_attn`
 
-The v1 README recommended `flashinfer`. On WSL2 with PyPI-only CUDA 13 (no system toolkit), this **crashes** during CUDA graph capture:
+The original WSL2 recipes use `flash_attn` because flashinfer JIT fails with
+the PyPI CUDA 13 fragments on sm_120. Installing the **full system CUDA 13
+toolkit** fixes this:
 
+```bash
+sudo apt install -y cuda-nvcc-13-0 cuda-cccl-13-0 cuda-cudart-dev-13-0
 ```
-RuntimeError: Ninja build failed...
-error: "CUDA compiler and CUDA toolkit headers are incompatible"
-```
 
-The CCCL headers in the PyPI `nvidia-cuda-nvcc` package conflict with flashinfer's JIT compilation for the `batch_prefill_with_kv_cache` kernel on sm_120f. This is also why `--kv-cache-dtype fp8_e5m2` crashes — it triggers the same flashinfer JIT path.
+This lets flashinfer JIT compile Blackwell kernels correctly, which in turn
+enables **FP8 KV cache** (`--kv-cache-dtype fp8_e4m3`). FP8 KV halves memory
+per token — from 267 KB/token to ~134 KB/token.
 
-`flash_attn` ships precompiled wheels that work on Blackwell out of the box. The tradeoff: no FP8 KV cache. At 96GB with INT4 weights (17GB), you still get ~228K tokens of BF16 KV cache — plenty for 256K context.
+### FP8 KV Cache Tradeoff
 
-If you have the **full system CUDA 13 toolkit** (`apt install cuda-toolkit-13-0`), you can switch to `flashinfer` + `--kv-cache-dtype fp8_e4m3` for ~10-15% more speed on long contexts.
+Measured at short context (fresh session). At long context the picture
+reverses: BF16 attention over 68GB of KV cache becomes bandwidth-bound and
+degrades, while FP8 attention over 34GB stays fast. **At 200K+, FP8 KV is
+actually faster than BF16.**
+
+| Config | t/s (short ctx) | KV/token | 256K users | Best for |
+|--------|----------------|---------|------------|----------|
+| flash_attn + BF16 KV | 115 / 200 | 267 KB | 1 | Short-context latency |
+| flashinfer + FP8 KV | 100 / 170 | 134 KB | **2** | **Long-context throughput** |
+
+- **Net positive at high context** — FP8 KV attention is ~2x cheaper in both
+  compute and bandwidth. The 15% penalty at low context reverses at 128K+
+- 68 GB → 34 GB KV cache at 256K — doubles concurrent users
+- Requires system CUDA 13 toolkit (PyPI CUDA fragments don't work)
+- Do NOT set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — breaks MTP
+  fork on WSL2
 
 ### Flag reference
 
 | Flag | What it does |
 |------|--------------|
-| `--attention-backend flash_attn` | Precompiled attention — avoids broken flashinfer JIT on WSL2 |
+| `--attention-backend flashinfer` | Native flashattention on Blackwell — requires system CUDA 13 toolkit |
+| `--kv-cache-dtype fp8_e4m3` | FP8 KV cache — halves memory per token, doubles concurrency at 256K |
 | `--quantization auto_round` | INT4 AutoRound quantization (Lorbus model) |
 | `--gpu-memory-utilization 0.92` | 92% of 96GB for model + cache |
-| `--max-num-seqs 8` | Concurrent request slots. vLLM's continuous batching interleaves decode across all 8. Increase to 16 for heavier multi-user loads; decrease to 2 for single-user lowest-latency |
-| `--enable-chunked-prefill` | Splits long prefills into chunks interleaved with generation — prevents one long prompt from blocking short ones |
-| `--enable-prefix-caching` | KV for identical prompt prefixes computed once and reused across requests. Huge win when many users share the same system prompt |
+| `--max-num-seqs 8` | Concurrent request slots. vLLM continuous batching interleaves decode. Increase to 16 for heavier multi-user; decrease to 2 for single-user |
+| `--enable-chunked-prefill` | Splits long prefills into chunks — prevents one prompt from blocking others |
+| `--enable-prefix-caching` | KV for identical prompt prefixes computed once. Huge win for shared system prompts |
 | `--language-model-only` | Skips vision encoder. Saves ~2GB VRAM |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | MTP speculative decoding — 3 draft tokens per forward pass |
 
 ---
 
-## Step 7 — Systemd service
+## Step 8 — Systemd service
 
 ```bash
 sudo tee /etc/systemd/system/vllm.service > /dev/null <<'EOF'
@@ -291,7 +309,7 @@ sudo journalctl -u vllm -f
 
 ---
 
-## Step 8 — Verify
+## Step 9 — Verify
 
 ```bash
 # Fast (no thinking — default)
@@ -324,18 +342,29 @@ Each GPU runs its own full vLLM server with `--max-num-seqs 8`. vLLM's continuou
 ### GPU 1 instance (35B FP8 MoE)
 
 ```bash
-# GPU 1 runs the FP8 MoE with MTP n=3. Create a separate start script:
+# GPU 1 runs the FP8 MoE with MTP n=3 + FP8 KV. Same CUDA 13 setup.
 sudo tee /usr/local/bin/start-vllm-gpu1.sh > /dev/null <<'VLLM'
 #!/bin/bash
 set -euo pipefail
-# ... same env vars as GPU 0 but CUDA_VISIBLE_DEVICES=1 ...
+export PATH=/usr/local/cuda-13.0/bin:/usr/bin:/usr/sbin
+export CUDA_HOME=/usr/local/cuda-13.0
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}
+export CUDA_VISIBLE_DEVICES=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_FLOAT32_MATMUL_PRECISION=high
+export NCCL_CUMEM_ENABLE=0
+export NCCL_P2P_DISABLE=1
+export OMP_NUM_THREADS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=8
+
 exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
   --model /opt/models/Qwen3.6-35B-A3B-FP8 \
   --served-model-name qwen3.6-35b-a3b \
   --host 127.0.0.1 --port 8001 \
   --trust-remote-code \
   --dtype auto \
-  --attention-backend flash_attn \
+  --attention-backend flashinfer \
+  --kv-cache-dtype fp8_e4m3 \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 8 \
@@ -519,8 +548,8 @@ docker compose --profile dual-gpu up -d
 
 | Source | Hardware | Config | tok/s (per GPU) | Notes |
 |---|---|---|
-| **This guide** | RTX PRO 6000 96GB | 27B INT4 + MTP n=3 | **120** | WSL2, flash_attn |
-| **This guide** | RTX PRO 6000 96GB | 35B FP8 MoE + MTP n=3 | **200** | WSL2, flash_attn |
+| **This guide** | RTX PRO 6000 96GB | 27B INT4 + MTP n=3 + FP8 KV | **100** | WSL2, flashinfer |
+| **This guide** | RTX PRO 6000 96GB | 35B FP8 MoE + MTP n=3 + FP8 KV | **170** | WSL2, flashinfer |
 | [CobraPhil](https://github.com/CobraPhil/qwen36-27b-single-5090) | RTX 5090 32GB | INT4 + Genesis + MTP n=3 | ~160 | Blackwell 32GB |
 | [Ollman blog](https://alexander-ollman.github.io/qwen3.6-on-rtx3090/) | RTX 3090 24GB | INT4 + Genesis + MTP n=5 | 100 | Native Linux |
 | [noonghunna](https://github.com/noonghunna/qwen36-27b-single-3090) | RTX 3090 24GB | INT4 + Genesis + MTP n=3 | 50-70 | Single 3090 |
