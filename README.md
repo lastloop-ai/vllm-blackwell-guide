@@ -206,7 +206,7 @@ exec /opt/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \
   --trust-remote-code \
   --quantization auto_round \
   --attention-backend flash_attn \
-  --max-model-len 131072 \
+  --max-model-len 262144 \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 8 \
   --skip-mm-profiling \
@@ -233,7 +233,7 @@ error: "CUDA compiler and CUDA toolkit headers are incompatible"
 
 The CCCL headers in the PyPI `nvidia-cuda-nvcc` package conflict with flashinfer's JIT compilation for the `batch_prefill_with_kv_cache` kernel on sm_120f. This is also why `--kv-cache-dtype fp8_e5m2` crashes — it triggers the same flashinfer JIT path.
 
-`flash_attn` ships precompiled wheels that work on Blackwell out of the box. The tradeoff: no FP8 KV cache. At 96GB with INT4 weights (17GB), you still get ~228K tokens of BF16 KV cache — plenty for 128K context.
+`flash_attn` ships precompiled wheels that work on Blackwell out of the box. The tradeoff: no FP8 KV cache. At 96GB with INT4 weights (17GB), you still get ~228K tokens of BF16 KV cache — plenty for 256K context.
 
 If you have the **full system CUDA 13 toolkit** (`apt install cuda-toolkit-13-0`), you can switch to `flashinfer` + `--kv-cache-dtype fp8_e4m3` for ~10-15% more speed on long contexts.
 
@@ -294,12 +294,22 @@ sudo journalctl -u vllm -f
 ## Step 8 — Verify
 
 ```bash
+# Fast (no thinking — default)
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "Say hello and nothing else."}],
     "max_tokens": 50
+  }'
+
+# With reasoning chain (append :think)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b:think",
+    "messages": [{"role": "user", "content": "Explain Fermat\'s Last Theorem"}],
+    "max_tokens": 200
   }'
 ```
 
@@ -345,7 +355,7 @@ GPU 1's service waits for GPU 0 to be healthy before starting. This prevents con
 ```bash
 sudo tee /etc/systemd/system/vllm-gpu1.service > /dev/null <<'EOF'
 [Unit]
-Description=vLLM GPU 1 — Qwen3.6-27B INT4 + MTP n=3
+Description=vLLM GPU 1 — Qwen3.6-35B-A3B FP8 + MTP n=3 (~200 tps)
 After=vllm.service
 
 [Service]
@@ -367,9 +377,11 @@ sudo systemctl enable vllm-gpu1
 ### Bridge (replaces nginx)
 
 This repo includes a Go bridge binary (`vllm-bridge`) that runs inside WSL2 alongside vLLM. It replaces nginx with built-in:
-- **Least-connections load balancing** across both GPU instances
-- **Per-backend health tracking** with 10s probe interval
-- **SSE streaming support** (flush every chunk, no write timeout)
+- **Model-aware routing** — probes `/v1/models` on each backend, routes requests to the GPU that serves the requested model
+- **Thinking off by default** — injects `enable_thinking: false` for fast time-to-first-token. Append `:think` to the model name to opt into reasoning (e.g. `qwen3.6-35b-a3b:think`)
+- **Least-connections load balancing** across backends sharing the same model
+- **Per-backend health tracking** with 10s probe interval and circuit breaker
+- **SSE streaming** — flush every chunk, no write timeout
 - **Retry on transient errors** for GET requests
 
 ```bash
@@ -496,7 +508,7 @@ docker compose --profile dual-gpu up -d
 |----------|---------|-------------|
 | `MODEL` | `/models/Qwen3.6-27B-int4-AutoRound` | Model path inside container |
 | `MODEL_NAME` | `qwen3.6-27b` | Name exposed via API |
-| `MAX_MODEL_LEN` | `131072` | Context length |
+| `MAX_MODEL_LEN` | `262144` | Context length (256K) |
 | `GPU_MEM_UTIL` | `0.92` | VRAM fraction |
 | `MAX_NUM_SEQS` | `8` | Concurrent request slots per GPU |
 | `NUM_SPEC_TOKENS` | `3` | MTP draft tokens per step |

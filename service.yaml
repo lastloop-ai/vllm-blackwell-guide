@@ -3,13 +3,16 @@ kind: ServiceManifest
 
 metadata:
   name: vllm-bridge
-  displayName: vLLM Bridge — Qwen 3.6 27B (Blackwell)
+  displayName: vLLM Bridge — Qwen 3.6 x2 (Blackwell)
   description: >
-    Health-aware load-balancing bridge for vLLM instances running
-    Qwen 3.6 27B INT4-AutoRound + MTP n=3 on Blackwell GPUs.
+    Health-aware model-routing bridge for vLLM instances running
+    Qwen 3.6 27B INT4-AutoRound + MTP n=3 (~115 t/s) on GPU 0 and
+    Qwen 3.6 35B-A3B FP8 + MTP n=3 (~200 t/s) on GPU 1.
     One vLLM instance per GPU, each serving 8 concurrent users via
-    continuous batching. Bridge routes to least-loaded GPU.
-    ~120 tok/s per GPU, 128K context. OpenAI-compatible API.
+    continuous batching. Bridge routes by model name for multi-model
+    setups. Defaults to enable_thinking=false for fast TTFT;
+    :think suffix enables reasoning chain. 256K context.
+    OpenAI-compatible API.
   owner: clemens
   repository: https://github.com/lastloop-ai/vllm-blackwell-guide
   tags:
@@ -31,7 +34,7 @@ spec:
       endpoints:
         - path: /v1/chat/completions
           method: POST
-          description: OpenAI-compatible chat completions (streaming + non-streaming)
+          description: OpenAI-compatible chat completions (streaming + non-streaming). Model-aware routing (27B→GPU0, 35B→GPU1). :think suffix enables reasoning.
         - path: /v1/completions
           method: POST
           description: OpenAI-compatible text completions
@@ -40,7 +43,7 @@ spec:
           description: List loaded models
         - path: /health
           method: GET
-          description: Per-backend health status with active request counts
+          description: Per-backend health status with model lists and active request counts
 
   technologies:
     runtime:
@@ -55,12 +58,18 @@ spec:
     setup: |
       1. Follow the README to install vLLM on WSL2 / Linux
       2. Start GPU 0: systemctl start vllm
-      3. Start GPU 1: systemctl start vllm-gpu1  (waits for GPU 0)
+      3. Start GPU 1: systemctl start vllm-gpu1  (waits for GPU 0 health)
       4. Start bridge: systemctl start vllm-bridge
-      5. SSH tunnel from your machine: ssh -L 8098:localhost:8098 stud2-wsl
+      5. SSH tunnel from Mac: ssh -N -L 8098:localhost:8098 stud2-wsl
     verify: |
       curl http://localhost:8098/health
     example: |
+      # Fast (default, no thinking)
       curl http://localhost:8098/v1/chat/completions \
         -H "Content-Type: application/json" \
-        -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+        -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+
+      # With reasoning chain
+      curl http://localhost:8098/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{"model":"qwen3.6-35b-a3b:think","messages":[{"role":"user","content":"Explain relativity"}],"max_tokens":200}'
