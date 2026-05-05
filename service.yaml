@@ -20,7 +20,7 @@ metadata:
     - local
     - vllm
     - federated
-    - qwen3.6
+    - qwen3-6
     - blackwell
 
 spec:
