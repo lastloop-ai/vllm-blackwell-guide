@@ -264,7 +264,7 @@ actually faster than BF16.**
 | `--gpu-memory-utilization 0.92` | 92% of 96GB for model + cache |
 | `--max-num-seqs 8` | Concurrent request slots. vLLM continuous batching interleaves decode. Increase to 16 for heavier multi-user; decrease to 2 for single-user |
 | `--enable-chunked-prefill` | Splits long prefills into chunks — prevents one prompt from blocking others |
-| `--enable-prefix-caching` | KV for identical prompt prefixes computed once. Huge win for shared system prompts |
+| `--enable-prefix-caching` | KV for identical prompt prefixes computed once. Huge win for shared system prompts. Measured 2.9-13.2x speedup on multi-turn sessions (see APC section below) |
 | `--language-model-only` | Skips vision encoder. Saves ~2GB VRAM |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | MTP speculative decoding — 3 draft tokens per forward pass |
 
